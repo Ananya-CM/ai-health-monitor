@@ -1,0 +1,9 @@
+datasets/
+backend/models/*.h5
+__pycache__/
+*.pyc
+.env
+*.zip
+*.dat
+*.hea
+*.atr
