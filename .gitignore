@@ -8,3 +8,5 @@ __pycache__/
 *.hea
 *.atr
 serviceAccountKey.json 
+backend/models/ 
+backend/serviceAccountKey* 

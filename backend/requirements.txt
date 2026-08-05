@@ -1,0 +1,6 @@
+flask==3.0.3
+tensorflow==2.21.0
+numpy
+firebase-admin
+python-dotenv
+requests
