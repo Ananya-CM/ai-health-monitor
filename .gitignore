@@ -10,3 +10,9 @@ __pycache__/
 serviceAccountKey.json 
 backend/models/ 
 backend/serviceAccountKey* 
+app/health_monitor/build/ 
+app/health_monitor/.dart_tool/ 
+app/health_monitor/ios/ 
+app/health_monitor/macos/ 
+app/health_monitor/linux/ 
+app/health_monitor/windows/ 

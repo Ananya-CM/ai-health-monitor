@@ -4,6 +4,8 @@ import tensorflow as tf
 import json
 import os
 from datetime import datetime
+import firebase_admin
+from firebase_admin import credentials, db as firebase_db
 
 app = Flask(__name__)
 
@@ -18,12 +20,17 @@ AE_THRESHOLD  = float(np.load(os.path.join(BASE, 'models', 'ae_threshold.npy'))[
 
 print(f"All models loaded. AE threshold: {AE_THRESHOLD:.6f}")
 
+cred = credentials.Certificate(os.path.join(BASE, 'serviceAccountKey.json'))
+firebase_admin.initialize_app(cred, {
+    'databaseURL': 'https://ai-health-monitor-4927f-default-rtdb.asia-southeast1.firebasedatabase.app'
+})
+print("Firebase Admin connected")
+
 # ── In-memory buffer for diabetes LSTM (needs 24 timesteps) ───────────────────
 patient_buffers = {}  # patient_id -> list of feature vectors
 
 # ── Alert classification ───────────────────────────────────────────────────────
-def classify_alert(hr, spo2, temp, activity, glucose,
-                   cnn_prob, ae_error, diab_risk):
+def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_risk):
 
     alert_tier    = "NONE"
     alert_message = ""
@@ -151,6 +158,25 @@ def analyse():
               f"Patient {patient_id} | HR={hr} SpO2={spo2} "
               f"CNN={cnn_prob:.3f} Risk={diab_risk:.3f} "
               f"Alert={alert_tier}")
+
+        # Write to Firebase so Flutter app updates in real time
+        try:
+            ref = firebase_db.reference(f'patient001/vitals')
+            ref.set({
+                'hr':            hr,
+                'spo2':          spo2,
+                'hrv_rmssd':     hrv,
+                'temp':          temp,
+                'activity':      activity,
+                'sweat_glucose': glucose,
+                'alert_tier':    alert_tier,
+                'alert_message': alert_message,
+                'cnn_prob':      round(cnn_prob, 4),
+                'diabetes_risk': round(diab_risk, 4),
+                'timestamp':     datetime.now().isoformat()
+            })
+        except Exception as e:
+            print(f"Firebase write error: {e}")
 
         return jsonify(response), 200
 
