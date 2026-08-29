@@ -16,3 +16,4 @@ app/health_monitor/ios/
 app/health_monitor/macos/ 
 app/health_monitor/linux/ 
 app/health_monitor/windows/ 
+firmware/esp32_health_monitor/secrets.h 
