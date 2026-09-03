@@ -13,7 +13,7 @@ app = Flask(__name__)
 print("Loading models...")
 BASE = os.path.dirname(os.path.abspath(__file__))
 
-cnn_model   = tf.keras.models.load_model(os.path.join(BASE, 'models', 'cardiac_cnn.h5'))
+cnn_model   = tf.keras.models.load_model(os.path.join(BASE, 'models', 'cardiac_cnn_ppg_final.h5'))
 autoencoder = tf.keras.models.load_model(os.path.join(BASE, 'models', 'lstm_autoencoder.keras'))
 diabetes_lstm = tf.keras.models.load_model(os.path.join(BASE, 'models', 'diabetes_lstm.keras'))
 AE_THRESHOLD  = float(np.load(os.path.join(BASE, 'models', 'ae_threshold.npy'))[0])
@@ -28,6 +28,66 @@ print("Firebase Admin connected")
 
 # ── In-memory buffer for diabetes LSTM (needs 24 timesteps) ───────────────────
 patient_buffers = {}  # patient_id -> list of feature vectors
+
+# ── HRV trend tracker (stores daily average HRV per patient) ──────────────────
+hrv_history = {}   # patient_id -> list of (timestamp, hrv_rmssd) tuples
+HRV_HISTORY_DAYS = 3        # days to look back
+HRV_DECLINE_THRESHOLD = 0.30  # 30% decline triggers BLUE alert
+
+# ── HRV trend analysis ─────────────────────────────────────────────────────────
+def check_hrv_trend(patient_id, current_hrv):
+    """
+    Stores HRV readings and checks for sustained decline over 3+ days.
+    Returns True if BLUE alert should fire.
+    """
+    from datetime import timedelta
+
+    now = datetime.now()
+
+    if patient_id not in hrv_history:
+        hrv_history[patient_id] = []
+
+    # Store current reading with timestamp
+    hrv_history[patient_id].append((now, current_hrv))
+
+    # Keep only last 7 days of readings
+    cutoff = now - timedelta(days=7)
+    hrv_history[patient_id] = [
+        (t, v) for t, v in hrv_history[patient_id] if t > cutoff
+    ]
+
+    readings = hrv_history[patient_id]
+
+    # Need at least readings spanning 3 days
+    if len(readings) < 6:
+        return False, 0.0
+
+    oldest_time = readings[0][0]
+    newest_time = readings[-1][0]
+    span_hours = (newest_time - oldest_time).total_seconds() / 3600
+
+    # Need at least 3 hours of data (for demo) or 72 hours (production)
+    # Using 3 hours for demo, change to 72 for clinical deployment
+    if span_hours < 0.01:  # 36 seconds minimum for demo
+        return False, 0.0
+
+    # Compare first quarter vs last quarter of readings
+    quarter = max(1, len(readings) // 4)
+    early_hrv = np.mean([v for _, v in readings[:quarter]])
+    recent_hrv = np.mean([v for _, v in readings[-quarter:]])
+
+    if early_hrv == 0:
+        return False, 0.0
+
+    decline_pct = (early_hrv - recent_hrv) / early_hrv
+
+    print(f"  HRV trend: early={early_hrv:.1f}ms, recent={recent_hrv:.1f}ms, "
+          f"decline={decline_pct*100:.1f}%, span={span_hours:.1f}hrs")
+
+    if decline_pct >= HRV_DECLINE_THRESHOLD:
+        return True, decline_pct
+
+    return False, decline_pct
 
 # ── Alert classification ───────────────────────────────────────────────────────
 def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_risk):
@@ -71,7 +131,7 @@ def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_r
                              f"abnormal pattern. HR={hr:.0f}, "
                              f"CNN score={cnn_prob:.2f}.")
 
-    # BLUE — advisory
+    # BLUE — HRV declining trend (early diabetic neuropathy marker)
     if alert_tier == "NONE":
         if diab_risk > 0.40:
             alert_tier    = "BLUE"
@@ -127,10 +187,20 @@ def analyse():
             diab_risk = 0.0  # not enough data yet
 
         # ── 4. Alert classification ────────────────────────────────────────────
+        # Check HRV declining trend before alert classification
+        hrv_declining, decline_pct = check_hrv_trend(patient_id, hrv)
+
         alert_tier, alert_message = classify_alert(
             hr, spo2, temp, activity, glucose,
             cnn_prob, ae_error, diab_risk
         )
+
+        # Override with BLUE if HRV trend detected and no higher alert
+        if alert_tier == "NONE" and hrv_declining:
+            alert_tier    = "BLUE"
+            alert_message = (f"DIABETES RISK RISING: HRV declining "
+                             f"{decline_pct*100:.1f}% over monitoring period. "
+                             f"Schedule consultation within 48 hours.")
 
         # ── 5. Build response ──────────────────────────────────────────────────
         response = {
