@@ -95,9 +95,17 @@ def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_r
     alert_tier    = "NONE"
     alert_message = ""
 
-    # RED — cardiac emergency
+    # RED — SpO2 hypoxia (fires immediately, no AI needed)
+    # SpO2 below 90% is clinical hypoxia regardless of cardiac status
+    if spo2 > 0 and spo2 < 90:
+        alert_tier    = "RED"
+        alert_message = (f"HYPOXIA ALERT: Blood oxygen critically low at "
+                         f"{spo2:.0f}%. Immediate oxygen support required.")
+        return alert_tier, alert_message
+
+    # RED — cardiac emergency (double confirmation: CNN + Autoencoder)
     if cnn_prob > 0.75 and ae_error > AE_THRESHOLD:
-        if hr > 150 or hr < 40 or spo2 < 90:
+        if hr > 150 or hr < 40 or spo2 < 94:
             alert_tier    = "RED"
             alert_message = (f"CARDIAC ALERT: Arrhythmia detected. "
                              f"HR={hr:.0f} BPM, SpO2={spo2:.0f}%. "
