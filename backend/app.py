@@ -3,9 +3,12 @@ import numpy as np
 import tensorflow as tf
 import json
 import os
-from datetime import datetime
+import threading
+import time
+from datetime import datetime, timedelta
 import firebase_admin
 from firebase_admin import credentials, db as firebase_db
+from firebase_admin import messaging
 
 app = Flask(__name__)
 
@@ -13,8 +16,8 @@ app = Flask(__name__)
 print("Loading models...")
 BASE = os.path.dirname(os.path.abspath(__file__))
 
-cnn_model   = tf.keras.models.load_model(os.path.join(BASE, 'models', 'cardiac_cnn_ppg_final.h5'))
-autoencoder = tf.keras.models.load_model(os.path.join(BASE, 'models', 'lstm_autoencoder.keras'))
+cnn_model     = tf.keras.models.load_model(os.path.join(BASE, 'models', 'cardiac_cnn_ppg_final.h5'))
+autoencoder   = tf.keras.models.load_model(os.path.join(BASE, 'models', 'lstm_autoencoder.keras'))
 diabetes_lstm = tf.keras.models.load_model(os.path.join(BASE, 'models', 'diabetes_lstm.keras'))
 AE_THRESHOLD  = float(np.load(os.path.join(BASE, 'models', 'ae_threshold.npy'))[0])
 
@@ -26,31 +29,23 @@ firebase_admin.initialize_app(cred, {
 })
 print("Firebase Admin connected")
 
-# ── In-memory buffer for diabetes LSTM (needs 24 timesteps) ───────────────────
+# ── In-memory buffers ──────────────────────────────────────────────────────────
 patient_buffers = {}  # patient_id -> list of feature vectors
-
-# ── HRV trend tracker (stores daily average HRV per patient) ──────────────────
-hrv_history = {}   # patient_id -> list of (timestamp, hrv_rmssd) tuples
-HRV_HISTORY_DAYS = 3        # days to look back
-HRV_DECLINE_THRESHOLD = 0.30  # 30% decline triggers BLUE alert
+last_alert_tier = {}  # patient_id -> last sent alert tier
+hrv_history     = {}  # patient_id -> list of (timestamp, hrv) tuples
+glucose_history = {}  # patient_id -> list of last 2 glucose readings
+HRV_DECLINE_THRESHOLD = 0.30
 
 # ── HRV trend analysis ─────────────────────────────────────────────────────────
 def check_hrv_trend(patient_id, current_hrv):
-    """
-    Stores HRV readings and checks for sustained decline over 3+ days.
-    Returns True if BLUE alert should fire.
-    """
-    from datetime import timedelta
-
     now = datetime.now()
 
     if patient_id not in hrv_history:
         hrv_history[patient_id] = []
 
-    # Store current reading with timestamp
-    hrv_history[patient_id].append((now, current_hrv))
+    if current_hrv > 0:
+        hrv_history[patient_id].append((now, current_hrv))
 
-    # Keep only last 7 days of readings
     cutoff = now - timedelta(days=7)
     hrv_history[patient_id] = [
         (t, v) for t, v in hrv_history[patient_id] if t > cutoff
@@ -58,25 +53,21 @@ def check_hrv_trend(patient_id, current_hrv):
 
     readings = hrv_history[patient_id]
 
-    # Need at least readings spanning 3 days
     if len(readings) < 6:
         return False, 0.0
 
     oldest_time = readings[0][0]
     newest_time = readings[-1][0]
-    span_hours = (newest_time - oldest_time).total_seconds() / 3600
+    span_hours  = (newest_time - oldest_time).total_seconds() / 3600
 
-    # Need at least 3 hours of data (for demo) or 72 hours (production)
-    # Using 3 hours for demo, change to 72 for clinical deployment
-    if span_hours < 0.01:  # 36 seconds minimum for demo
+    if span_hours < 0.01:
         return False, 0.0
 
-    # Compare first quarter vs last quarter of readings
-    quarter = max(1, len(readings) // 4)
-    early_hrv = np.mean([v for _, v in readings[:quarter]])
+    quarter    = max(1, len(readings) // 4)
+    early_hrv  = np.mean([v for _, v in readings[:quarter]])
     recent_hrv = np.mean([v for _, v in readings[-quarter:]])
 
-    if early_hrv == 0:
+    if early_hrv < 5.0:
         return False, 0.0
 
     decline_pct = (early_hrv - recent_hrv) / early_hrv
@@ -89,21 +80,29 @@ def check_hrv_trend(patient_id, current_hrv):
 
     return False, decline_pct
 
+def is_hypo_confirmed(patient_id, glucose):
+    if patient_id not in glucose_history:
+        glucose_history[patient_id] = []
+    glucose_history[patient_id].append(glucose)
+    if len(glucose_history[patient_id]) > 2:
+        glucose_history[patient_id].pop(0)
+    return (len(glucose_history[patient_id]) == 2 and
+            all(0 < g < 0.05 for g in glucose_history[patient_id]))
+
 # ── Alert classification ───────────────────────────────────────────────────────
-def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_risk):
+def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_risk, hypo_confirmed):
 
     alert_tier    = "NONE"
     alert_message = ""
 
-    # RED — SpO2 hypoxia (fires immediately, no AI needed)
-    # SpO2 below 90% is clinical hypoxia regardless of cardiac status
-    if spo2 > 0 and spo2 < 90:
+    # RED — SpO2 hypoxia (immediate, no AI needed)
+    if 0 < spo2 <= 100 and spo2 < 90:
         alert_tier    = "RED"
         alert_message = (f"HYPOXIA ALERT: Blood oxygen critically low at "
                          f"{spo2:.0f}%. Immediate oxygen support required.")
         return alert_tier, alert_message
 
-    # RED — cardiac emergency (double confirmation: CNN + Autoencoder)
+    # RED — cardiac emergency (double confirmation)
     if cnn_prob > 0.75 and ae_error > AE_THRESHOLD:
         if hr > 150 or hr < 40 or spo2 < 94:
             alert_tier    = "RED"
@@ -111,13 +110,13 @@ def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_r
                              f"HR={hr:.0f} BPM, SpO2={spo2:.0f}%. "
                              f"Call ambulance immediately.")
 
-    # RED — hypoglycemia (sweat glucose critically low)
-    if glucose > 0 and glucose < 0.05:
+    # RED — hypoglycemia (confirmed over 2 consecutive readings)
+    if hypo_confirmed:
         alert_tier    = "RED"
         alert_message = (f"HYPOGLYCEMIA ALERT: Sweat glucose critically low "
                          f"({glucose:.3f} mmol/L). Patient may lose consciousness.")
 
-    # RED — tremor + tachycardia at rest (hypoglycemia signature)
+    # RED — tremor + tachycardia
     if activity > 0.8 and hr > 100 and glucose < 0.1:
         alert_tier    = "RED"
         alert_message = (f"HYPOGLYCEMIA ALERT: Tremor + elevated HR detected "
@@ -125,11 +124,16 @@ def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_r
 
     # AMBER — diabetes warning
     if alert_tier == "NONE":
-        if diab_risk > 0.65 or (glucose > 0.80):
-            alert_tier    = "AMBER"
-            alert_message = (f"DIABETES WARNING: High glucose risk detected. "
-                             f"Risk score={diab_risk:.2f}. "
-                             f"Patient should check blood sugar.")
+        if diab_risk > 0.65 or glucose > 0.80:
+            alert_tier = "AMBER"
+            if diab_risk > 0.65:
+                alert_message = (f"DIABETES WARNING: High diabetes risk detected. "
+                                f"Risk score={diab_risk:.2f}. "
+                                f"Patient should check blood sugar.")
+            else:
+                alert_message = (f"DIABETES WARNING: Elevated glucose level detected. "
+                                f"Glucose={glucose:.2f} mmol/L. "
+                                f"Patient should check blood sugar.")
 
     # AMBER — cardiac pre-event
     if alert_tier == "NONE":
@@ -139,7 +143,7 @@ def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_r
                              f"abnormal pattern. HR={hr:.0f}, "
                              f"CNN score={cnn_prob:.2f}.")
 
-    # BLUE — HRV declining trend (early diabetic neuropathy marker)
+    # BLUE — advisory
     if alert_tier == "NONE":
         if diab_risk > 0.40:
             alert_tier    = "BLUE"
@@ -149,14 +153,119 @@ def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_r
 
     return alert_tier, alert_message
 
+# ── Run AI models on sensor data ───────────────────────────────────────────────
+def run_ai(patient_id, hr, spo2, hrv, temp, activity, glucose):
+    # CNN cardiac window
+    cardiac_window = np.array([hr/200, spo2/100, hrv/100,
+                               temp/40, activity/3] * 72)[:360]
+    cardiac_window = cardiac_window.reshape(1, 360, 1)
+
+    cnn_prob = float(cnn_model.predict(cardiac_window, verbose=0)[0][0])
+
+    ae_recon = autoencoder.predict(cardiac_window, verbose=0)
+    ae_error = float(np.mean(np.power(cardiac_window - ae_recon, 2)))
+
+    # Diabetes LSTM
+    feature_vec = np.array([hr/200, temp/40, activity/3, hrv/100, glucose])
+    if patient_id not in patient_buffers:
+        patient_buffers[patient_id] = []
+    patient_buffers[patient_id].append(feature_vec)
+    if len(patient_buffers[patient_id]) > 24:
+        patient_buffers[patient_id].pop(0)
+
+    diab_risk = 0.0
+    if len(patient_buffers[patient_id]) == 24:
+        lstm_input = np.array(patient_buffers[patient_id]).reshape(1, 24, 5)
+        diab_risk  = float(diabetes_lstm.predict(lstm_input, verbose=0)[0][0])
+
+    # HRV trend + alert classification
+    hypo_confirmed = is_hypo_confirmed(patient_id, glucose)
+    hrv_declining, decline_pct = check_hrv_trend(patient_id, hrv)
+    alert_tier, alert_message  = classify_alert(
+        hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_risk, hypo_confirmed
+    )
+
+    if alert_tier == "NONE" and hrv_declining:
+        alert_tier    = "BLUE"
+        alert_message = (f"DIABETES RISK RISING: HRV declining "
+                         f"{decline_pct*100:.1f}% over monitoring period. "
+                         f"Schedule consultation within 48 hours.")
+
+    return cnn_prob, ae_error, diab_risk, alert_tier, alert_message
+
+# ── Firebase listener — reads ESP32 data and runs AI ──────────────────────────
+def firebase_listener():
+    print("Firebase listener started — watching patient001/vitals...")
+    last_processed = None
+
+    while True:
+        try:
+            ref  = firebase_db.reference('patient001/vitals')
+            data = ref.get()
+
+            if data and isinstance(data, dict):
+                current_ts = str(data.get('timestamp', ''))
+
+                if True:  # process every reading
+
+                    hr       = float(data.get('hr', 0))
+                    spo2     = float(data.get('spo2', 0))
+                    hrv      = float(data.get('hrv_rmssd', 0))
+                    temp     = float(data.get('temp', 0))
+                    activity = float(data.get('activity', 0))
+                    glucose  = float(data.get('sweat_glucose', 0))
+
+                    if hr > 0:
+                        cnn_prob, ae_error, diab_risk, alert_tier, alert_message = \
+                            run_ai('patient001', hr, spo2, hrv, temp, activity, glucose)
+
+                        # Write alert back to Firebase
+                        firebase_db.reference('patient001/vitals').update({
+                            'alert_tier':    alert_tier,
+                            'alert_message': alert_message,
+                            'cnn_prob':      round(cnn_prob, 4),
+                            'diabetes_risk': round(diab_risk, 4),
+                        })
+
+                        if alert_tier in ("RED", "AMBER") and last_alert_tier.get('patient001') != alert_tier:
+                            send_fcm_alert(alert_tier, alert_message)
+                        last_alert_tier['patient001'] = alert_tier
+
+                        print(f"[ESP32→AI] HR={hr} SpO2={spo2} "
+                              f"Glu={glucose:.3f} CNN={cnn_prob:.3f} "
+                              f"AE={ae_error:.4f} Risk={diab_risk:.3f} "
+                              f"Alert={alert_tier}")
+
+        except Exception as e:
+            print(f"Listener error: {e}")
+
+        time.sleep(5)
+
+def send_fcm_alert(alert_tier, alert_message):
+    token = firebase_db.reference('doctor_device/fcm_token').get()
+    if not token:
+        print("[FCM] No device token registered yet")
+        return
+    msg = messaging.Message(
+        notification=messaging.Notification(
+            title=f"{alert_tier} ALERT — Patient Vitals",
+            body=alert_message
+        ),
+        token=token
+    )
+    try:
+        response = messaging.send(msg)
+        print(f"[FCM] Sent: {response}")
+    except Exception as e:
+        print(f"[FCM] Failed: {e}")
+
 # ── Main analysis endpoint ─────────────────────────────────────────────────────
 @app.route('/analyse', methods=['POST'])
 def analyse():
     try:
-        data = request.get_json()
+        data       = request.get_json()
         patient_id = data.get('patient_id', 'default')
 
-        # Extract sensor values
         hr       = float(data.get('hr', 0))
         spo2     = float(data.get('spo2', 0))
         hrv      = float(data.get('hrv_rmssd', 0))
@@ -164,72 +273,27 @@ def analyse():
         activity = float(data.get('activity', 0))
         glucose  = float(data.get('sweat_glucose', 0))
 
-        # ── 1. CNN cardiac analysis ────────────────────────────────────────────
-        # Use hr, spo2, hrv, temp, activity as a proxy 360-point window
-        # In production this will be the actual PPG waveform from MAX30102
-        cardiac_window = np.array([hr/200, spo2/100, hrv/100,
-                                   temp/40, activity/3] * 72)[:360]
-        cardiac_window = cardiac_window.reshape(1, 360, 1)
-        cnn_prob = float(cnn_model.predict(cardiac_window, verbose=0)[0][0])
+        cnn_prob, ae_error, diab_risk, alert_tier, alert_message = \
+            run_ai(patient_id, hr, spo2, hrv, temp, activity, glucose)
 
-        # ── 2. LSTM Autoencoder anomaly verification ───────────────────────────
-        ae_input = cardiac_window
-        ae_recon = autoencoder.predict(ae_input, verbose=0)
-        ae_error = float(np.mean(np.power(ae_input - ae_recon, 2)))
-
-        # ── 3. Diabetes LSTM ───────────────────────────────────────────────────
-        feature_vec = np.array([hr/200, temp/40, activity/3,
-                                hrv/100, glucose])
-        if patient_id not in patient_buffers:
-            patient_buffers[patient_id] = []
-        patient_buffers[patient_id].append(feature_vec)
-
-        # Keep last 24 timesteps
-        if len(patient_buffers[patient_id]) > 24:
-            patient_buffers[patient_id].pop(0)
-
-        if len(patient_buffers[patient_id]) == 24:
-            lstm_input = np.array(patient_buffers[patient_id]).reshape(1, 24, 5)
-            diab_risk  = float(diabetes_lstm.predict(lstm_input, verbose=0)[0][0])
-        else:
-            diab_risk = 0.0  # not enough data yet
-
-        # ── 4. Alert classification ────────────────────────────────────────────
-        # Check HRV declining trend before alert classification
-        hrv_declining, decline_pct = check_hrv_trend(patient_id, hrv)
-
-        alert_tier, alert_message = classify_alert(
-            hr, spo2, temp, activity, glucose,
-            cnn_prob, ae_error, diab_risk
-        )
-
-        # Override with BLUE if HRV trend detected and no higher alert
-        if alert_tier == "NONE" and hrv_declining:
-            alert_tier    = "BLUE"
-            alert_message = (f"DIABETES RISK RISING: HRV declining "
-                             f"{decline_pct*100:.1f}% over monitoring period. "
-                             f"Schedule consultation within 48 hours.")
-
-        # ── 5. Build response ──────────────────────────────────────────────────
         response = {
-            "patient_id":    patient_id,
-            "timestamp":     datetime.now().isoformat(),
+            "patient_id":  patient_id,
+            "timestamp":   datetime.now().isoformat(),
             "vitals": {
                 "hr": hr, "spo2": spo2, "hrv": hrv,
-                "temp": temp, "activity": activity,
-                "glucose": glucose
+                "temp": temp, "activity": activity, "glucose": glucose
             },
             "ai_scores": {
-                "cnn_cardiac_prob": round(cnn_prob, 4),
+                "cnn_cardiac_prob":       round(cnn_prob, 4),
                 "ae_reconstruction_error": round(ae_error, 6),
-                "ae_threshold": round(AE_THRESHOLD, 6),
-                "diabetes_risk": round(diab_risk, 4)
+                "ae_threshold":           round(AE_THRESHOLD, 6),
+                "diabetes_risk":          round(diab_risk, 4)
             },
             "alert": {
                 "tier":    alert_tier,
                 "message": alert_message
             },
-            "buffer_size": len(patient_buffers[patient_id])
+            "buffer_size": len(patient_buffers.get(patient_id, []))
         }
 
         print(f"[{datetime.now().strftime('%H:%M:%S')}] "
@@ -237,10 +301,9 @@ def analyse():
               f"CNN={cnn_prob:.3f} Risk={diab_risk:.3f} "
               f"Alert={alert_tier}")
 
-        # Write to Firebase so Flutter app updates in real time
+        # Write to Firebase
         try:
-            ref = firebase_db.reference(f'patient001/vitals')
-            ref.set({
+            firebase_db.reference('patient001/vitals').set({
                 'hr':            hr,
                 'spo2':          spo2,
                 'hrv_rmssd':     hrv,
@@ -253,6 +316,8 @@ def analyse():
                 'diabetes_risk': round(diab_risk, 4),
                 'timestamp':     datetime.now().isoformat()
             })
+            if alert_tier in ("RED", "AMBER"):
+                send_fcm_alert(alert_tier, alert_message)
         except Exception as e:
             print(f"Firebase write error: {e}")
 
@@ -261,17 +326,17 @@ def analyse():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ── Health check endpoint ──────────────────────────────────────────────────────
+# ── Health check ───────────────────────────────────────────────────────────────
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
-        "status": "running",
-        "models": ["cardiac_cnn", "lstm_autoencoder", "diabetes_lstm"],
+        "status":       "running",
+        "models":       ["cardiac_cnn", "lstm_autoencoder", "diabetes_lstm"],
         "ae_threshold": AE_THRESHOLD,
-        "timestamp": datetime.now().isoformat()
+        "timestamp":    datetime.now().isoformat()
     }), 200
 
-# ── Test endpoint — simulate all alert tiers ───────────────────────────────────
+# ── Test endpoint ──────────────────────────────────────────────────────────────
 @app.route('/test/<tier>', methods=['GET'])
 def test_alert(tier):
     test_data = {
@@ -285,10 +350,9 @@ def test_alert(tier):
     if tier.upper() not in test_data:
         return jsonify({"error": "Use RED, AMBER, or BLUE"}), 400
 
-    d = test_data[tier.upper()]
+    d   = test_data[tier.upper()]
     pid = d["patient_id"]
 
-    # Pre-fill buffer for BLUE with borderline diabetic values
     if tier.upper() == "BLUE":
         patient_buffers[pid] = []
         for _ in range(23):
@@ -304,7 +368,11 @@ def test_alert(tier):
         data=json.dumps(d)
     ):
         return analyse()
-    
+
+# ── Start ──────────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
+    # Start Firebase listener thread — processes real ESP32 data
+    t = threading.Thread(target=firebase_listener, daemon=True)
+    t.start()
     print("Starting Flask backend on port 5000...")
     app.run(host='0.0.0.0', port=5000, debug=False)
