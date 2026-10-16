@@ -194,61 +194,77 @@ def run_ai(patient_id, hr, spo2, hrv, temp, activity, glucose):
     return cnn_prob, ae_error, diab_risk, alert_tier, alert_message
 
 # ── Firebase listener — reads ESP32 data and runs AI ──────────────────────────
+PATIENT_PREFIX = 'patient'
+
+def discover_patient_ids():
+    """Return every top-level Firebase node that looks like a patient record."""
+    keys = firebase_db.reference('/').get(shallow=True) or {}
+    return sorted(k for k in keys if k.startswith(PATIENT_PREFIX))
+
+def process_patient(patient_id):
+    """Run the AI pipeline on one patient's latest vitals and write results back."""
+    vitals_ref = firebase_db.reference(f'{patient_id}/vitals')
+    data = vitals_ref.get()
+    if not data or not isinstance(data, dict):
+        return
+
+    hr       = float(data.get('hr', 0))
+    spo2     = float(data.get('spo2', 0))
+    hrv      = float(data.get('hrv_rmssd', 0))
+    temp     = float(data.get('temp', 0))
+    activity = float(data.get('activity', 0))
+    glucose  = float(data.get('sweat_glucose', 0))
+
+    if hr <= 0:
+        return
+
+    cnn_prob, ae_error, diab_risk, alert_tier, alert_message = \
+        run_ai(patient_id, hr, spo2, hrv, temp, activity, glucose)
+
+    vitals_ref.update({
+        'alert_tier':    alert_tier,
+        'alert_message': alert_message,
+        'cnn_prob':      round(cnn_prob, 4),
+        'diabetes_risk': round(diab_risk, 4),
+        'timestamp':     datetime.now().isoformat(),
+    })
+
+    if alert_tier in ("RED", "AMBER") and last_alert_tier.get(patient_id) != alert_tier:
+        send_fcm_alert(alert_tier, alert_message, patient_id)
+    last_alert_tier[patient_id] = alert_tier
+
+    print(f"[{patient_id}] HR={hr} SpO2={spo2} "
+          f"Glu={glucose:.3f} CNN={cnn_prob:.3f} "
+          f"AE={ae_error:.4f} Risk={diab_risk:.3f} "
+          f"Alert={alert_tier}")
+
 def firebase_listener():
-    print("Firebase listener started — watching patient001/vitals...")
-    last_processed = None
+    print("Firebase listener started — watching all patient*/vitals nodes...")
 
     while True:
         try:
-            ref  = firebase_db.reference('patient001/vitals')
-            data = ref.get()
-
-            if data and isinstance(data, dict):
-                current_ts = str(data.get('timestamp', ''))
-
-                if True:  # process every reading
-
-                    hr       = float(data.get('hr', 0))
-                    spo2     = float(data.get('spo2', 0))
-                    hrv      = float(data.get('hrv_rmssd', 0))
-                    temp     = float(data.get('temp', 0))
-                    activity = float(data.get('activity', 0))
-                    glucose  = float(data.get('sweat_glucose', 0))
-
-                    if hr > 0:
-                        cnn_prob, ae_error, diab_risk, alert_tier, alert_message = \
-                            run_ai('patient001', hr, spo2, hrv, temp, activity, glucose)
-
-                        # Write alert back to Firebase
-                        firebase_db.reference('patient001/vitals').update({
-                            'alert_tier':    alert_tier,
-                            'alert_message': alert_message,
-                            'cnn_prob':      round(cnn_prob, 4),
-                            'diabetes_risk': round(diab_risk, 4),
-                        })
-
-                        if alert_tier in ("RED", "AMBER") and last_alert_tier.get('patient001') != alert_tier:
-                            send_fcm_alert(alert_tier, alert_message)
-                        last_alert_tier['patient001'] = alert_tier
-
-                        print(f"[ESP32→AI] HR={hr} SpO2={spo2} "
-                              f"Glu={glucose:.3f} CNN={cnn_prob:.3f} "
-                              f"AE={ae_error:.4f} Risk={diab_risk:.3f} "
-                              f"Alert={alert_tier}")
-
+            patient_ids = discover_patient_ids()
         except Exception as e:
-            print(f"Listener error: {e}")
+            print(f"Listener error (patient discovery): {e}")
+            patient_ids = []
+
+        for patient_id in patient_ids:
+            try:
+                process_patient(patient_id)
+            except Exception as e:
+                # One failing patient must not stop monitoring of the others.
+                print(f"Listener error ({patient_id}): {e}")
 
         time.sleep(5)
 
-def send_fcm_alert(alert_tier, alert_message):
+def send_fcm_alert(alert_tier, alert_message, patient_id='patient001'):
     token = firebase_db.reference('doctor_device/fcm_token').get()
     if not token:
         print("[FCM] No device token registered yet")
         return
     msg = messaging.Message(
         notification=messaging.Notification(
-            title=f"{alert_tier} ALERT — Patient Vitals",
+            title=f"{alert_tier} ALERT — {patient_id}",
             body=alert_message
         ),
         token=token
@@ -301,9 +317,11 @@ def analyse():
               f"CNN={cnn_prob:.3f} Risk={diab_risk:.3f} "
               f"Alert={alert_tier}")
 
-        # Write to Firebase
+        # Write to Firebase. Real patient IDs map to their own node; ad-hoc/test
+        # IDs fall back to the demo patient so the dashboard still shows them.
+        FIREBASE_TARGET = patient_id if patient_id.startswith(PATIENT_PREFIX) else 'patient001'
         try:
-            firebase_db.reference('patient001/vitals').set({
+            firebase_db.reference(f'{FIREBASE_TARGET}/vitals').set({
                 'hr':            hr,
                 'spo2':          spo2,
                 'hrv_rmssd':     hrv,
@@ -317,7 +335,7 @@ def analyse():
                 'timestamp':     datetime.now().isoformat()
             })
             if alert_tier in ("RED", "AMBER"):
-                send_fcm_alert(alert_tier, alert_message)
+                send_fcm_alert(alert_tier, alert_message, FIREBASE_TARGET)
         except Exception as e:
             print(f"Firebase write error: {e}")
 

@@ -28,10 +28,21 @@ A real-time IoT + AI health monitoring system that uses wearable sensors to trac
 ```
 
 **Data Flow:**
-1. ESP32 reads sensors every 5 seconds → pushes to Firebase (`patient001/vitals`)
-2. Flask listener detects new data → runs all 3 AI models
-3. Flask writes `alert_tier` + `alert_message` back to Firebase
-4. Flutter dashboard reads Firebase in real time → displays alerts
+1. ESP32 reads sensors every 5 seconds → pushes to Firebase (`<patient_id>/vitals`, e.g. `patient001/vitals`)
+2. Flask listener scans every `patient*` node → runs all 3 AI models for each patient
+3. Flask writes `alert_tier`, `alert_message`, risk scores and a `timestamp` back to Firebase
+4. For RED / AMBER alerts Flask sends a push notification (FCM) to the doctor's phone
+5. Flutter dashboard reads Firebase in real time → shows vitals, alerts and a live trend graph
+
+---
+
+## ✨ Features
+
+- Live vitals dashboard: heart rate, SpO₂, HRV (RMSSD), temperature, sweat glucose, diabetes risk
+- **Live trend graph** (fl_chart): last 60 readings for any vital, with a chip selector and touch tooltips
+- **Multi-patient backend**: the listener auto-discovers every `patient*` node in Firebase; one failing patient never blocks the others
+- Four-tier alerts (RED / AMBER / BLUE / NONE) with FCM push notifications
+- **Offline buffering on the ESP32**: if Wi-Fi or Firebase is down, up to 120 readings (~10 min) are kept in RAM, Wi-Fi is retried every 10 s, and the buffered readings are uploaded to `<patient_id>/backfill` when the connection returns (timestamps come from NTP)
 
 ---
 
@@ -109,18 +120,20 @@ A real-time IoT + AI health monitoring system that uses wearable sensors to trac
 
 ### 2. ESP32 Firmware
 
-1. Open `firmware/esp32_health_monitor.ino` in Arduino IDE
+1. Open `firmware/esp32_health_monitor/esp32_health_monitor.ino` in Arduino IDE
+   (create `secrets.h` next to it with `WIFI_SSID`, `WIFI_PASSWORD`, `FIREBASE_HOST`, `FIREBASE_AUTH` — it is not committed)
 2. Install the following libraries:
    - `MAX30105` (SparkFun)
    - `DallasTemperature` + `OneWire`
    - `MPU6050`
    - `Adafruit_SSD1306`
-   - `FirebaseESP32`
-3. Update WiFi credentials and Firebase URL in the sketch:
+   - `Firebase ESP Client` (Mobizt)
+   - `Adafruit_GFX`
+3. Put your WiFi credentials and Firebase URL / secret in `secrets.h`:
 ```cpp
 #define WIFI_SSID      "YourWiFiName"
 #define WIFI_PASSWORD  "YourPassword"
-#define FIREBASE_HOST  "your-project.firebaseio.com"
+#define FIREBASE_HOST  "https://your-project.firebasedatabase.app"
 #define FIREBASE_AUTH  "your-database-secret"
 ```
 4. Upload to ESP32 (115200 baud)
@@ -135,26 +148,29 @@ git clone https://github.com/Ananya-CM/ai-health-monitor.git
 cd ai-health-monitor/backend
 
 # Install dependencies
-pip install flask tensorflow keras pyrebase4 numpy
+pip install -r requirements.txt
 
-# Configure Firebase credentials in app.py
-FIREBASE_CONFIG = {
-    "apiKey": "...",
-    "authDomain": "...",
-    "databaseURL": "https://your-project.firebaseio.com",
-    "storageBucket": "..."
-}
+# Firebase Admin credentials: download a service-account key from
+# Firebase console → Project settings → Service accounts and save it as
+# backend/serviceAccountKey.json (not committed). Set your database URL in app.py.
+
+# Place the three trained models in backend/models/ (not committed):
+#   cardiac_cnn_ppg_final.h5, lstm_autoencoder.keras, diabetes_lstm.keras, ae_threshold.npy
 
 # Run the backend
 python app.py
 ```
 
-The Flask server runs on `http://0.0.0.0:5000`. A background thread listens to Firebase every 5 seconds and processes vitals through all 3 AI models.
+On Windows, `start_backend.bat` launches the backend in one click (edit the folder path inside it first).
+
+Other endpoints: `POST /analyse` (run the models on one reading), `GET /health`, `GET /test/RED|AMBER|BLUE` (demo alerts).
+
+The Flask server runs on `http://0.0.0.0:5000`. A background thread checks every `patient*` node in Firebase every 5 seconds and processes each patient's vitals through all 3 AI models. To add a patient, write vitals to `patientXXX/vitals` — no backend change is needed (add the patient to `kPatients` in the Flutter app to show them in the list).
 
 **Expected terminal output:**
 ```
-[ESP32→AI] HR=75 SpO2=99 Glu=0.320 CNN=0.123 AE=0.011 Risk=0.31 Alert=NONE
-[ESP32→AI] HR=80 SpO2=97 Glu=0.008 CNN=0.145 AE=0.009 Risk=0.02 Alert=RED
+[patient001] HR=75 SpO2=99 Glu=0.320 CNN=0.123 AE=0.011 Risk=0.31 Alert=NONE
+[patient001] HR=80 SpO2=97 Glu=0.008 CNN=0.145 AE=0.009 Risk=0.02 Alert=RED
 ```
 
 ---
@@ -174,7 +190,9 @@ flutter run -d chrome
 flutter build apk --release
 ```
 
-Make sure `google-services.json` is in `android/app/` before building.
+Make sure `google-services.json` is in `android/app/` before building, and replace the Firebase web config in `lib/firebase_config.dart` with your own project's values.
+
+**Android notifications:** some phones delay or block notifications for battery saving. On the doctor's phone, set the app's battery usage to *Unrestricted* (Settings → Apps → AI Health Monitor → Battery) so alerts arrive when the phone is locked.
 
 ---
 
@@ -189,7 +207,8 @@ ai-health-monitor/
 │       ├── lstm_autoencoder.keras
 │       └── diabetes_lstm.keras
 ├── firmware/
-│   └── esp32_health_monitor.ino      # Arduino sketch for ESP32
+│   └── esp32_health_monitor/
+│       └── esp32_health_monitor.ino  # Arduino sketch for ESP32 (+ secrets.h, not committed)
 ├── app/
 │   └── health_monitor/               # Flutter project
 │       ├── lib/
@@ -230,6 +249,9 @@ All models were trained in Google Colab. Notebooks are in the `notebooks/` folde
 | True RMSSD HRV | Estimated from HR (60000/HR) | Future firmware work |
 | Sweat glucose biosensor | Potentiometer simulation | Research prototype |
 | Firebase India region | Singapore region (closest available) | Future work |
+| Offline buffer | Kept in RAM only; lost if the ESP32 reboots, oldest data dropped after ~10 min | Future work: flash storage |
+| Notifications | One doctor device token (`doctor_device/fcm_token`) for all patients | Future work: per-doctor accounts |
+| Models / notebooks | Trained models are not committed to the repo | Add to `backend/models/` locally |
 
 > This is a **research prototype** demonstrating AI-assisted health monitoring. It is not a certified medical device.
 

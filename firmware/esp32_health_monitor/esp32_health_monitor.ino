@@ -9,6 +9,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <math.h>
+#include <time.h>
 
 // ── WiFi and Firebase credentials ────────────────────────────────────────────
 #include "secrets.h"
@@ -62,6 +63,71 @@ unsigned long lastTempTime    = 0;
 float         currentTemp     = 0;
 const long    SEND_INTERVAL   = 5000;
 const long    TEMP_INTERVAL   = 3000;
+
+// ── Offline buffering (readings kept in RAM while Wi-Fi / Firebase is down) ───
+struct Reading {
+  uint32_t epoch;      // UTC seconds (0 if the clock is not synced yet)
+  uint32_t uptimeSec;  // fallback key when no NTP time is available
+  float hr, spo2, hrv, temp, activity, glucose;
+};
+#define OFFLINE_CAPACITY 120   // 120 readings x 5 s = 10 minutes of data
+#define FLUSH_CHUNK      20    // readings uploaded per loop pass
+Reading offlineBuf[OFFLINE_CAPACITY];
+int     offlineCount = 0;
+
+const unsigned long WIFI_RETRY_MS = 10000;
+unsigned long       lastWifiTry   = 0;
+
+uint32_t currentEpoch() {
+  time_t now = time(nullptr);
+  return (now > 1700000000) ? (uint32_t)now : 0;  // 0 = NTP not synced
+}
+
+// Reconnect Wi-Fi if it dropped (non-blocking: one attempt every 10 s).
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if (millis() - lastWifiTry < WIFI_RETRY_MS) return;
+  lastWifiTry = millis();
+  Serial.println("WiFi lost - reconnecting...");
+  WiFi.disconnect();
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+// Store one reading; when full, the oldest reading is dropped.
+void bufferReading(const Reading& r) {
+  if (offlineCount == OFFLINE_CAPACITY) {
+    memmove(&offlineBuf[0], &offlineBuf[1], sizeof(Reading) * (OFFLINE_CAPACITY - 1));
+    offlineCount--;
+  }
+  offlineBuf[offlineCount++] = r;
+  Serial.println("Offline: buffered reading (" + String(offlineCount) + " stored)");
+}
+
+// Upload buffered readings to /patient001/backfill in small chunks.
+void flushOfflineBuffer() {
+  if (offlineCount == 0) return;
+  int n = offlineCount < FLUSH_CHUNK ? offlineCount : FLUSH_CHUNK;
+
+  FirebaseJson json;
+  for (int i = 0; i < n; i++) {
+    const Reading& r = offlineBuf[i];
+    String key = r.epoch ? String(r.epoch) : ("u" + String(r.uptimeSec));
+    json.set(key + "/hr",            r.hr);
+    json.set(key + "/spo2",          r.spo2);
+    json.set(key + "/hrv_rmssd",     r.hrv);
+    json.set(key + "/temp",          r.temp);
+    json.set(key + "/activity",      r.activity);
+    json.set(key + "/sweat_glucose", r.glucose);
+  }
+
+  if (Firebase.RTDB.updateNode(&fbdo, "/patient001/backfill", &json)) {
+    memmove(&offlineBuf[0], &offlineBuf[n], sizeof(Reading) * (offlineCount - n));
+    offlineCount -= n;
+    Serial.println("Offline: uploaded " + String(n) + ", remaining " + String(offlineCount));
+  } else {
+    Serial.println("Offline: upload failed - " + fbdo.errorReason());
+  }
+}
 
 // ══════════════════════════════════════════════════════════════════════════════
 void setup() {
@@ -129,6 +195,9 @@ void setup() {
     oledShow("WiFi FAILED", "No internet", "", "", "", "");
   }
   delay(1000);
+
+  // Sync the clock so buffered readings carry real timestamps
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 
   // Firebase init
   config.database_url = FIREBASE_HOST;
@@ -269,11 +338,17 @@ void loop() {
   oledShow(l1.c_str(), l2.c_str(), l3.c_str(),
            l4.c_str(), l5.c_str(), l6.c_str());
 
-  // ── Send to Firebase every 5 seconds ──────────────────────────────────────
+  // ── Send to Firebase every 5 seconds (buffer if offline) ──────────────────
+  maintainWiFi();
+
   if (millis() - lastSendTime >= SEND_INTERVAL) {
     lastSendTime = millis();
 
-    if (Firebase.ready()) {
+    Reading r = { currentEpoch(), (uint32_t)(millis() / 1000),
+                  smoothHR, smoothSPO2, smoothHRV, currentTemp, activity, glucose };
+
+    bool sent = false;
+    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
       FirebaseJson json;
       json.set("hr",            smoothHR);
       json.set("spo2",          smoothSPO2);
@@ -283,11 +358,16 @@ void loop() {
       json.set("sweat_glucose", glucose);
       json.set("patient_id",    "patient001");
 
-      if (Firebase.RTDB.setJSON(&fbdo, "/patient001/vitals", &json))
+      if (Firebase.RTDB.setJSON(&fbdo, "/patient001/vitals", &json)) {
         Serial.println("Firebase: OK");
-      else
+        sent = true;
+      } else {
         Serial.println("Firebase error: " + fbdo.errorReason());
+      }
     }
+
+    if (sent) flushOfflineBuffer();   // back online: upload what was missed
+    else      bufferReading(r);       // offline: keep the reading for later
   }
 }
 
