@@ -1,9 +1,11 @@
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'firebase_config.dart';
 import 'dart:async';
+import 'package:fl_chart/fl_chart.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,7 +18,16 @@ void main() async {
       databaseURL:       FirebaseConfig.databaseURL,
     ),
   );
-  await setupFCM();
+  // Push notifications are for the Android app. On Chrome (web) they need a
+  // service-worker file, so skip them there; any FCM failure must never
+  // stop the dashboard from loading.
+  if (!kIsWeb) {
+    try {
+      await setupFCM();
+    } catch (e) {
+      debugPrint('FCM setup failed: $e');
+    }
+  }
   runApp(const HealthMonitorApp());
 }
 
@@ -420,6 +431,24 @@ class NoDeviceScreen extends StatelessWidget {
   }
 }
 
+// ─── Live trend graph configuration ──────────────────────────────────────────
+class _TrendCfg {
+  final Color color;
+  final String unit;
+  final int decimals;
+  final double minY, maxY, minPad;
+  const _TrendCfg(this.color, this.unit, this.decimals, this.minY, this.maxY,
+      this.minPad);
+}
+
+const Map<String, _TrendCfg> _trendSeries = {
+  'Heart Rate':  _TrendCfg(Color(0xFFE53935), 'BPM',    0, 40, 140, 5),
+  'SpO\u2082':    _TrendCfg(Color(0xFF1565C0), '%',      0, 85, 100, 1),
+  'HRV':         _TrendCfg(Color(0xFF00695C), 'ms',     0, 0, 100,  5),
+  'Temperature': _TrendCfg(Color(0xFFE65100), '\u00b0C', 1, 35, 39,  0.3),
+  'Glucose':     _TrendCfg(Color(0xFF6A1B9A), 'mmol/L', 3, 0, 1,    0.05),
+};
+
 // ─── Dashboard Screen ─────────────────────────────────────────────────────────
 class DashboardScreen extends StatefulWidget {
   final Patient patient;
@@ -435,6 +464,14 @@ class _DashboardScreenState extends State<DashboardScreen> {
   String lastUpdate = '';
   bool connected = false;
   StreamSubscription? _sub;
+
+  // Rolling history for the live trend graph (one point per 5 s reading).
+  static const int _maxPoints = 60;
+  final Map<String, List<double>> _history = {
+    for (final k in _trendSeries.keys) k: <double>[],
+  };
+  String _selectedTrend = 'Heart Rate';
+  String _lastTimestamp = '';
 
   @override
   void initState() {
@@ -459,8 +496,24 @@ class _DashboardScreenState extends State<DashboardScreen> {
         alertMessage = data['alert_message']?.toString() ?? '';
         final ts     = data['timestamp']?.toString() ?? '';
         lastUpdate   = ts.length >= 19 ? ts.substring(11, 19) : ts;
+
+        // Append only when a new reading arrives (avoid duplicate points).
+        if (ts.isNotEmpty && ts != _lastTimestamp) {
+          _lastTimestamp = ts;
+          _pushPoint('Heart Rate', hr);
+          _pushPoint('SpO\u2082', spo2);
+          _pushPoint('HRV', hrv);
+          _pushPoint('Temperature', temp);
+          _pushPoint('Glucose', glucose);
+        }
       });
     });
+  }
+
+  void _pushPoint(String key, double value) {
+    final list = _history[key]!;
+    list.add(value);
+    if (list.length > _maxPoints) list.removeAt(0);
   }
 
   @override
@@ -591,6 +644,8 @@ class _DashboardScreenState extends State<DashboardScreen> {
                 const SizedBox(height: 12),
                 _diabRiskCard(),
                 const SizedBox(height: 12),
+                _trendCard(),
+                const SizedBox(height: 12),
                 _statusBar(),
                 const SizedBox(height: 8),
               ],
@@ -657,6 +712,137 @@ class _DashboardScreenState extends State<DashboardScreen> {
                   fontSize: 22,
                   fontWeight: FontWeight.bold,
                   letterSpacing: -0.5)),
+        ],
+      ),
+    );
+  }
+
+  Widget _trendCard() {
+    final cfg = _trendSeries[_selectedTrend]!;
+    final values = _history[_selectedTrend]!;
+    final spots = <FlSpot>[
+      for (int i = 0; i < values.length; i++) FlSpot(i.toDouble(), values[i]),
+    ];
+
+    double minY = cfg.minY, maxY = cfg.maxY;
+    if (values.isNotEmpty) {
+      final lo = values.reduce((a, b) => a < b ? a : b);
+      final hi = values.reduce((a, b) => a > b ? a : b);
+      final pad = ((hi - lo) * 0.2).clamp(cfg.minPad, double.infinity);
+      minY = lo - pad;
+      maxY = hi + pad;
+    }
+
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(14),
+        boxShadow: [
+          BoxShadow(
+              color: cfg.color.withOpacity(0.10),
+              blurRadius: 10,
+              offset: const Offset(0, 3)),
+        ],
+      ),
+      padding: const EdgeInsets.fromLTRB(16, 16, 16, 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(children: [
+            Icon(Icons.show_chart_rounded, color: cfg.color, size: 20),
+            const SizedBox(width: 8),
+            const Text('Live Trend',
+                style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: Color(0xFF1A1A2E))),
+            const Spacer(),
+            Text('last ${values.length} readings',
+                style: TextStyle(fontSize: 11, color: Colors.grey.shade500)),
+          ]),
+          const SizedBox(height: 10),
+          Wrap(
+            spacing: 6,
+            runSpacing: 4,
+            children: [
+              for (final name in _trendSeries.keys)
+                ChoiceChip(
+                  label: Text(name, style: const TextStyle(fontSize: 11)),
+                  selected: name == _selectedTrend,
+                  selectedColor: _trendSeries[name]!.color.withOpacity(0.18),
+                  visualDensity: VisualDensity.compact,
+                  onSelected: (_) => setState(() => _selectedTrend = name),
+                ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          SizedBox(
+            height: 180,
+            child: spots.length < 2
+                ? Center(
+                    child: Text('Waiting for readings...',
+                        style: TextStyle(
+                            color: Colors.grey.shade500, fontSize: 12)))
+                : LineChart(
+                    LineChartData(
+                      minX: 0,
+                      maxX: (_maxPoints - 1).toDouble(),
+                      minY: minY,
+                      maxY: maxY,
+                      gridData: FlGridData(
+                        show: true,
+                        drawVerticalLine: false,
+                        getDrawingHorizontalLine: (_) => FlLine(
+                            color: Colors.grey.shade200, strokeWidth: 1),
+                      ),
+                      borderData: FlBorderData(show: false),
+                      titlesData: FlTitlesData(
+                        topTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        rightTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        bottomTitles: const AxisTitles(
+                            sideTitles: SideTitles(showTitles: false)),
+                        leftTitles: AxisTitles(
+                          sideTitles: SideTitles(
+                            showTitles: true,
+                            reservedSize: 38,
+                            getTitlesWidget: (v, meta) => Text(
+                              v.toStringAsFixed(cfg.decimals),
+                              style: TextStyle(
+                                  fontSize: 10, color: Colors.grey.shade500),
+                            ),
+                          ),
+                        ),
+                      ),
+                      lineTouchData: LineTouchData(
+                        touchTooltipData: LineTouchTooltipData(
+                          getTooltipItems: (touched) => touched
+                              .map((t) => LineTooltipItem(
+                                    '${t.y.toStringAsFixed(cfg.decimals)} ${cfg.unit}',
+                                    const TextStyle(
+                                        color: Colors.white,
+                                        fontSize: 11,
+                                        fontWeight: FontWeight.w600),
+                                  ))
+                              .toList(),
+                        ),
+                      ),
+                      lineBarsData: [
+                        LineChartBarData(
+                          spots: spots,
+                          isCurved: true,
+                          curveSmoothness: 0.2,
+                          color: cfg.color,
+                          barWidth: 2.5,
+                          dotData: const FlDotData(show: false),
+                          belowBarData: BarAreaData(
+                              show: true, color: cfg.color.withOpacity(0.10)),
+                        ),
+                      ],
+                    ),
+                  ),
+          ),
         ],
       ),
     );
