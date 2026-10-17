@@ -1,5 +1,7 @@
-import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart'
+    show kIsWeb, defaultTargetPlatform, TargetPlatform;
 import 'package:flutter/material.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
@@ -29,6 +31,22 @@ void main() async {
     }
   }
   runApp(const HealthMonitorApp());
+  if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
+    await requestBatteryExemption();
+  }
+}
+
+/// Android may delay background notifications to save battery. Ask the user
+/// once per launch (until granted) to exempt this app so alerts arrive on time.
+Future<void> requestBatteryExemption() async {
+  try {
+    final status = await Permission.ignoreBatteryOptimizations.status;
+    if (!status.isGranted) {
+      await Permission.ignoreBatteryOptimizations.request();
+    }
+  } catch (e) {
+    debugPrint('Battery optimisation request failed: $e');
+  }
 }
 
 Future<void> setupFCM() async {
