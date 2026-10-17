@@ -78,6 +78,10 @@ int     offlineCount = 0;
 const unsigned long WIFI_RETRY_MS = 10000;
 unsigned long       lastWifiTry   = 0;
 
+// Test aid: type 'o' in the Serial Monitor to behave as if offline for 60 s.
+const unsigned long SIMULATED_OFFLINE_MS = 60000;
+unsigned long       simulatedOfflineUntil = 0;
+
 uint32_t currentEpoch() {
   time_t now = time(nullptr);
   return (now > 1700000000) ? (uint32_t)now : 0;  // 0 = NTP not synced
@@ -211,6 +215,15 @@ void setup() {
 
 // ══════════════════════════════════════════════════════════════════════════════
 void loop() {
+
+  // ── Test aid: 'o' in the Serial Monitor simulates a connection loss ────────
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'o' || c == 'O') {
+      simulatedOfflineUntil = millis() + SIMULATED_OFFLINE_MS;
+      Serial.println("TEST: simulating offline for 60 seconds");
+    }
+  }
 
   // ── Shift buffer and read 25 new samples ───────────────────────────────────
   for (byte i = 25; i < 100; i++) {
@@ -348,7 +361,8 @@ void loop() {
                   smoothHR, smoothSPO2, smoothHRV, currentTemp, activity, glucose };
 
     bool sent = false;
-    if (WiFi.status() == WL_CONNECTED && Firebase.ready()) {
+    bool simulatedOffline = (long)(simulatedOfflineUntil - millis()) > 0;
+    if (!simulatedOffline && WiFi.status() == WL_CONNECTED && Firebase.ready()) {
       FirebaseJson json;
       json.set("hr",            smoothHR);
       json.set("spo2",          smoothSPO2);
