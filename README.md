@@ -31,7 +31,7 @@ A real-time IoT + AI health monitoring system that uses wearable sensors to trac
 1. ESP32 reads sensors every 5 seconds → pushes to Firebase (`<patient_id>/vitals`, e.g. `patient001/vitals`)
 2. Flask listener scans every `patient*` node → runs all 3 AI models for each patient
 3. Flask writes `alert_tier`, `alert_message`, risk scores and a `timestamp` back to Firebase
-4. For RED / AMBER alerts Flask sends a push notification (FCM) to the doctor's phone
+4. For RED / AMBER alerts Flask sends a push notification (FCM) to every signed-in doctor's phone
 5. Flutter dashboard reads Firebase in real time → shows vitals, alerts and a live trend graph
 
 ---
@@ -42,7 +42,9 @@ A real-time IoT + AI health monitoring system that uses wearable sensors to trac
 - **Live trend graph** (fl_chart): last 60 readings for any vital, with a chip selector and touch tooltips
 - **Multi-patient backend**: the listener auto-discovers every `patient*` node in Firebase; one failing patient never blocks the others
 - Four-tier alerts (RED / AMBER / BLUE / NONE) with FCM push notifications
-- **Offline buffering on the ESP32**: if Wi-Fi or Firebase is down, up to 120 readings (~10 min) are kept in RAM, Wi-Fi is retried every 10 s, and the buffered readings are uploaded to `<patient_id>/backfill` when the connection returns (timestamps come from NTP)
+- **Doctor sign-in**: the app requires an email/password login (Firebase Authentication); only accounts listed under `doctors` in the database can read patient vitals
+- **Per-doctor notifications**: each signed-in doctor's phone registers its own FCM token (`doctor_tokens/<uid>`), and alerts go to all of them
+- **Offline buffering on the ESP32**: if Wi-Fi or Firebase is down, up to 120 readings (~10 min) are kept in RAM and mirrored to flash, Wi-Fi is retried every 10 s, and the buffered readings are uploaded to `<patient_id>/backfill` when the connection returns, even after a reboot or power cut (timestamps come from NTP)
 
 ---
 
@@ -105,16 +107,10 @@ A real-time IoT + AI health monitoring system that uses wearable sensors to trac
 
 1. Create a project at [console.firebase.google.com](https://console.firebase.google.com)
 2. Enable **Realtime Database** (choose Asia-Southeast1 region)
-3. Set database rules to allow read/write (for development):
-```json
-{
-  "rules": {
-    ".read": true,
-    ".write": true
-  }
-}
-```
-4. Download `google-services.json` and place it in `app/health_monitor/android/app/`
+3. Enable **Authentication → Sign-in method → Email/Password**, then add a doctor under **Authentication → Users**
+4. In the Realtime Database, add a top-level node `doctors` containing the user's UID as a key with the boolean value `true`
+5. Publish the rules from [`database.rules.json`](database.rules.json) in the **Rules** tab. Only signed-in doctors can read patient data. The ESP32 (database secret) and the Flask backend (service account) use admin credentials, which bypass these rules
+6. Download `google-services.json` and place it in `app/health_monitor/android/app/`
 
 ---
 
@@ -192,7 +188,7 @@ flutter build apk --release
 
 Make sure `google-services.json` is in `android/app/` before building, and replace the Firebase web config in `lib/firebase_config.dart` with your own project's values.
 
-**Android notifications:** some phones delay or block notifications for battery saving. On the doctor's phone, set the app's battery usage to *Unrestricted* (Settings → Apps → AI Health Monitor → Battery) so alerts arrive when the phone is locked.
+**Android notifications:** some phones delay notifications for battery saving. On launch the app asks to be allowed to run in the background; tap *Allow*. If you declined, set the app's battery usage to *Unrestricted* (Settings → Apps → AI Health Monitor → Battery) so alerts arrive when the phone is locked.
 
 ---
 
@@ -249,8 +245,8 @@ All models were trained in Google Colab. Notebooks are in the `notebooks/` folde
 | True RMSSD HRV | Estimated from HR (60000/HR) | Future firmware work |
 | Sweat glucose biosensor | Potentiometer simulation | Research prototype |
 | Firebase India region | Singapore region (closest available) | Future work |
-| Offline buffer | Kept in RAM only; lost if the ESP32 reboots, oldest data dropped after ~10 min | Future work: flash storage |
-| Notifications | One doctor device token (`doctor_device/fcm_token`) for all patients | Future work: per-doctor accounts |
+| Offline buffer | Holds 120 readings (~10 min); the oldest are dropped in a longer outage, and nothing is recorded while the device is off | Buffered readings survive a reboot (flash) |
+| Notifications | One device per doctor account (`doctor_tokens/<uid>`); signing in on a second phone replaces the first | Future work: multiple devices per doctor |
 | Models / notebooks | Trained models are not committed to the repo | Add to `backend/models/` locally |
 
 > This is a **research prototype** demonstrating AI-assisted health monitoring. It is not a certified medical device.
