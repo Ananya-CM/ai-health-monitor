@@ -40,19 +40,39 @@ Future<void> requestBatteryExemption() async {
   }
 }
 
+/// Each signed-in doctor registers their own device token, so every doctor
+/// gets the alerts on their own phone.
 Future<void> setupFCM() async {
+  final uid = FirebaseAuth.instance.currentUser?.uid;
+  if (uid == null) return;
+  final tokenRef = FirebaseDatabase.instance.ref('doctor_tokens/$uid');
+
   await FirebaseMessaging.instance.requestPermission();
 
   String? token = await FirebaseMessaging.instance.getToken();
   if (token != null) {
-    await FirebaseDatabase.instance
-        .ref('doctor_device/fcm_token')
-        .set(token);
+    await tokenRef.set(token);
   }
+  FirebaseMessaging.instance.onTokenRefresh.listen((newToken) {
+    tokenRef.set(newToken);
+  });
 
   FirebaseMessaging.onMessage.listen((RemoteMessage message) {
     // optional: show banner/snackbar while app is open
   });
+}
+
+/// Stop alerts on this device, then sign out.
+Future<void> signOutDoctor() async {
+  final uid = FirebaseAuth.instance.currentUser?.uid;
+  if (uid != null && !kIsWeb) {
+    try {
+      await FirebaseDatabase.instance.ref('doctor_tokens/$uid').remove();
+    } catch (e) {
+      debugPrint('Token removal failed: $e');
+    }
+  }
+  await FirebaseAuth.instance.signOut();
 }
 
 // ─── Patient model ────────────────────────────────────────────────────────────
@@ -196,7 +216,7 @@ class _NotAuthorisedScreen extends StatelessWidget {
               ),
               const SizedBox(height: 20),
               OutlinedButton(
-                onPressed: () => FirebaseAuth.instance.signOut(),
+                onPressed: signOutDoctor,
                 child: const Text('Sign out'),
               ),
             ],
@@ -395,7 +415,7 @@ class PatientListScreen extends StatelessWidget {
             trailing: IconButton(
               tooltip: 'Sign out',
               icon: const Icon(Icons.logout, color: Colors.white, size: 20),
-              onPressed: () => FirebaseAuth.instance.signOut(),
+              onPressed: signOutDoctor,
             ),
           ),
           Container(

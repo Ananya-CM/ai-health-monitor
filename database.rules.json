@@ -7,9 +7,9 @@
         ".read": "auth != null && auth.uid === $uid"
       }
     },
-    "doctor_device": {
-      "fcm_token": {
-        ".write": "auth != null && root.child('doctors').child(auth.uid).val() === true"
+    "doctor_tokens": {
+      "$uid": {
+        ".write": "auth != null && auth.uid === $uid && root.child('doctors').child(auth.uid).val() === true"
       }
     },
     "$patientId": {

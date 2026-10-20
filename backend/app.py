@@ -258,22 +258,33 @@ def firebase_listener():
         time.sleep(5)
 
 def send_fcm_alert(alert_tier, alert_message, patient_id='patient001'):
-    token = firebase_db.reference('doctor_device/fcm_token').get()
-    if not token:
-        print("[FCM] No device token registered yet")
+    """Send the alert to every signed-in doctor's device.
+
+    Each doctor's app registers its own token at doctor_tokens/<uid>.
+    """
+    tokens = firebase_db.reference('doctor_tokens').get() or {}
+    if not tokens:
+        print("[FCM] No doctor device tokens registered yet")
         return
-    msg = messaging.Message(
-        notification=messaging.Notification(
-            title=f"{alert_tier} ALERT — {patient_id}",
-            body=alert_message
-        ),
-        token=token
-    )
-    try:
-        response = messaging.send(msg)
-        print(f"[FCM] Sent: {response}")
-    except Exception as e:
-        print(f"[FCM] Failed: {e}")
+    for doctor_uid, token in tokens.items():
+        if not token:
+            continue
+        msg = messaging.Message(
+            notification=messaging.Notification(
+                title=f"{alert_tier} ALERT — {patient_id}",
+                body=alert_message
+            ),
+            token=token
+        )
+        try:
+            response = messaging.send(msg)
+            print(f"[FCM] Sent to {doctor_uid[:6]}...: {response}")
+        except messaging.UnregisteredError:
+            # App was uninstalled or the token expired: stop sending to it.
+            firebase_db.reference(f'doctor_tokens/{doctor_uid}').delete()
+            print(f"[FCM] Removed stale token for {doctor_uid[:6]}...")
+        except Exception as e:
+            print(f"[FCM] Failed for {doctor_uid[:6]}...: {e}")
 
 # ── Main analysis endpoint ─────────────────────────────────────────────────────
 @app.route('/analyse', methods=['POST'])
