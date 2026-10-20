@@ -10,6 +10,7 @@
 #include <Adafruit_SSD1306.h>
 #include <math.h>
 #include <time.h>
+#include <LittleFS.h>
 
 // ── WiFi and Firebase credentials ────────────────────────────────────────────
 #include "secrets.h"
@@ -97,13 +98,74 @@ void maintainWiFi() {
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 }
 
+// ── Flash copy of the offline buffer (survives a reboot or power cut) ─────────
+const char*    OFFLINE_FILE  = "/offline.bin";
+const char*    OFFLINE_TMP   = "/offline.tmp";
+const uint32_t OFFLINE_MAGIC = 0xA5E50000UL | (uint32_t)sizeof(Reading);
+bool           flashReady    = false;
+
+// Rewrite the whole file from RAM (used after an upload or when the buffer is full).
+void persistRewrite() {
+  if (!flashReady) return;
+  if (offlineCount == 0) {
+    LittleFS.remove(OFFLINE_FILE);
+    return;
+  }
+  File f = LittleFS.open(OFFLINE_TMP, FILE_WRITE);
+  if (!f) {
+    Serial.println("Flash: cannot write offline file");
+    return;
+  }
+  f.write((const uint8_t*)&OFFLINE_MAGIC, sizeof(OFFLINE_MAGIC));
+  f.write((const uint8_t*)offlineBuf, sizeof(Reading) * offlineCount);
+  f.close();
+  LittleFS.remove(OFFLINE_FILE);
+  LittleFS.rename(OFFLINE_TMP, OFFLINE_FILE);
+}
+
+// Add one reading to the end of the file.
+void persistAppend(const Reading& r) {
+  if (!flashReady) return;
+  File f = LittleFS.open(OFFLINE_FILE, FILE_APPEND);
+  if (!f) return;
+  if (f.size() == 0) f.write((const uint8_t*)&OFFLINE_MAGIC, sizeof(OFFLINE_MAGIC));
+  f.write((const uint8_t*)&r, sizeof(Reading));
+  f.close();
+}
+
+// At boot: load readings that were waiting to be uploaded before the restart.
+void loadPersistedBuffer() {
+  if (!flashReady) return;
+  if (!LittleFS.exists(OFFLINE_FILE) && LittleFS.exists(OFFLINE_TMP)) {
+    LittleFS.rename(OFFLINE_TMP, OFFLINE_FILE);
+  }
+  if (!LittleFS.exists(OFFLINE_FILE)) return;
+  File f = LittleFS.open(OFFLINE_FILE, FILE_READ);
+  if (!f) return;
+  uint32_t magic = 0;
+  bool valid = (f.read((uint8_t*)&magic, sizeof(magic)) == sizeof(magic)) &&
+               (magic == OFFLINE_MAGIC);
+  if (valid) {
+    while (offlineCount < OFFLINE_CAPACITY &&
+           f.read((uint8_t*)&offlineBuf[offlineCount], sizeof(Reading)) == sizeof(Reading)) {
+      offlineCount++;
+    }
+  }
+  f.close();
+  if (!valid) LittleFS.remove(OFFLINE_FILE);
+  Serial.println("Flash: restored " + String(offlineCount) + " buffered readings");
+}
+
 // Store one reading; when full, the oldest reading is dropped.
 void bufferReading(const Reading& r) {
-  if (offlineCount == OFFLINE_CAPACITY) {
+  bool wasFull = (offlineCount == OFFLINE_CAPACITY);
+  if (wasFull) {
     memmove(&offlineBuf[0], &offlineBuf[1], sizeof(Reading) * (OFFLINE_CAPACITY - 1));
     offlineCount--;
   }
   offlineBuf[offlineCount++] = r;
+  if (wasFull) persistRewrite();
+  else         persistAppend(r);
   Serial.println("Offline: buffered reading (" + String(offlineCount) + " stored)");
 }
 
@@ -127,6 +189,7 @@ void flushOfflineBuffer() {
   if (Firebase.RTDB.updateNode(&fbdo, "/patient001/backfill", &json)) {
     memmove(&offlineBuf[0], &offlineBuf[n], sizeof(Reading) * (offlineCount - n));
     offlineCount -= n;
+    persistRewrite();
     Serial.println("Offline: uploaded " + String(n) + ", remaining " + String(offlineCount));
   } else {
     Serial.println("Offline: upload failed - " + fbdo.errorReason());
@@ -138,6 +201,11 @@ void setup() {
   Serial.begin(115200);
   Wire.begin(21, 22);
   delay(1000);
+
+  // Mount flash storage and reload any readings that were not yet uploaded.
+  flashReady = LittleFS.begin(true);
+  if (!flashReady) Serial.println("Flash: mount failed - offline buffer will not survive a reboot");
+  loadPersistedBuffer();
 
   // OLED init
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
