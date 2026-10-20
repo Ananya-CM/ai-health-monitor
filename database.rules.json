@@ -1,0 +1,19 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "doctors": {
+      "$uid": {
+        ".read": "auth != null && auth.uid === $uid"
+      }
+    },
+    "doctor_device": {
+      "fcm_token": {
+        ".write": "auth != null && root.child('doctors').child(auth.uid).val() === true"
+      }
+    },
+    "$patientId": {
+      ".read": "$patientId.matches(/^patient[0-9]+$/) && auth != null && root.child('doctors').child(auth.uid).val() === true"
+    }
+  }
+}

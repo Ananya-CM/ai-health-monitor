@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart'
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'package:firebase_messaging/firebase_messaging.dart';
 import 'firebase_config.dart';
@@ -20,16 +21,6 @@ void main() async {
       databaseURL:       FirebaseConfig.databaseURL,
     ),
   );
-  // Push notifications are for the Android app. On Chrome (web) they need a
-  // service-worker file, so skip them there; any FCM failure must never
-  // stop the dashboard from loading.
-  if (!kIsWeb) {
-    try {
-      await setupFCM();
-    } catch (e) {
-      debugPrint('FCM setup failed: $e');
-    }
-  }
   runApp(const HealthMonitorApp());
   if (!kIsWeb && defaultTargetPlatform == TargetPlatform.android) {
     await requestBatteryExemption();
@@ -104,7 +95,240 @@ class HealthMonitorApp extends StatelessWidget {
         useMaterial3: true,
         fontFamily: 'Roboto',
       ),
-      home: const PatientListScreen(),
+      home: const AuthGate(),
+    );
+  }
+}
+
+// ─── Authentication ───────────────────────────────────────────────────────────
+/// Shows the login screen until a doctor is signed in.
+class AuthGate extends StatelessWidget {
+  const AuthGate({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<User?>(
+      stream: FirebaseAuth.instance.authStateChanges(),
+      builder: (context, snapshot) {
+        if (snapshot.connectionState == ConnectionState.waiting) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        if (snapshot.data == null) return const LoginScreen();
+        return _DoctorGate(key: ValueKey(snapshot.data!.uid));
+      },
+    );
+  }
+}
+
+/// Lets a signed-in user through only if their uid is in the `doctors`
+/// allowlist in the database. Push notifications are registered here, after
+/// sign-in (Android only; on Chrome they need a service worker, and an FCM
+/// failure must never stop the dashboard from loading).
+class _DoctorGate extends StatefulWidget {
+  const _DoctorGate({super.key});
+
+  @override
+  State<_DoctorGate> createState() => _DoctorGateState();
+}
+
+class _DoctorGateState extends State<_DoctorGate> {
+  late final Future<bool> _isDoctor = _checkDoctor();
+
+  Future<bool> _checkDoctor() async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return false;
+    try {
+      final snap = await FirebaseDatabase.instance.ref('doctors/$uid').get();
+      if (snap.value != true) return false;
+    } catch (e) {
+      debugPrint('Doctor check failed: $e');
+      return false;
+    }
+    if (!kIsWeb) {
+      try {
+        await setupFCM();
+      } catch (e) {
+        debugPrint('FCM setup failed: $e');
+      }
+    }
+    return true;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<bool>(
+      future: _isDoctor,
+      builder: (context, snapshot) {
+        if (snapshot.connectionState != ConnectionState.done) {
+          return const Scaffold(body: Center(child: CircularProgressIndicator()));
+        }
+        if (snapshot.data == true) return const PatientListScreen();
+        return const _NotAuthorisedScreen();
+      },
+    );
+  }
+}
+
+class _NotAuthorisedScreen extends StatelessWidget {
+  const _NotAuthorisedScreen();
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF0F2F5),
+      body: Center(
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Icon(Icons.lock_outline, size: 48, color: Color(0xFF002060)),
+              const SizedBox(height: 16),
+              const Text(
+                'This account is not authorised',
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Ask the administrator to add your account as a doctor.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.grey),
+              ),
+              const SizedBox(height: 20),
+              OutlinedButton(
+                onPressed: () => FirebaseAuth.instance.signOut(),
+                child: const Text('Sign out'),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final _emailController = TextEditingController();
+  final _passwordController = TextEditingController();
+  bool _loading = false;
+  String? _error;
+
+  @override
+  void dispose() {
+    _emailController.dispose();
+    _passwordController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _signIn() async {
+    final email = _emailController.text.trim();
+    final password = _passwordController.text;
+    if (email.isEmpty || password.isEmpty) {
+      setState(() => _error = 'Enter your email and password.');
+      return;
+    }
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      await FirebaseAuth.instance
+          .signInWithEmailAndPassword(email: email, password: password);
+    } on FirebaseAuthException catch (e) {
+      final badCredentials = e.code == 'invalid-credential' ||
+          e.code == 'wrong-password' ||
+          e.code == 'user-not-found' ||
+          e.code == 'invalid-email';
+      if (mounted) {
+        setState(() => _error = badCredentials
+            ? 'Incorrect email or password.'
+            : e.code == 'too-many-requests'
+                ? 'Too many attempts. Try again later.'
+                : 'Sign-in failed. Check your connection and try again.');
+      }
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFFF0F2F5),
+      body: Center(
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(24),
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 380),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Icon(Icons.monitor_heart, size: 48, color: Color(0xFF002060)),
+                const SizedBox(height: 12),
+                const Text(
+                  'AI Health Monitor',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 4),
+                const Text(
+                  'Doctor sign-in',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.grey),
+                ),
+                const SizedBox(height: 24),
+                TextField(
+                  controller: _emailController,
+                  keyboardType: TextInputType.emailAddress,
+                  autofillHints: const [AutofillHints.email],
+                  decoration: const InputDecoration(
+                    labelText: 'Email',
+                    border: OutlineInputBorder(),
+                    filled: true,
+                    fillColor: Colors.white,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: _passwordController,
+                  obscureText: true,
+                  autofillHints: const [AutofillHints.password],
+                  onSubmitted: (_) => _signIn(),
+                  decoration: const InputDecoration(
+                    labelText: 'Password',
+                    border: OutlineInputBorder(),
+                    filled: true,
+                    fillColor: Colors.white,
+                  ),
+                ),
+                if (_error != null) ...[
+                  const SizedBox(height: 12),
+                  Text(_error!, style: const TextStyle(color: Colors.red)),
+                ],
+                const SizedBox(height: 20),
+                FilledButton(
+                  onPressed: _loading ? null : _signIn,
+                  child: _loading
+                      ? const SizedBox(
+                          height: 18,
+                          width: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Sign in'),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -166,7 +390,14 @@ class PatientListScreen extends StatelessWidget {
       backgroundColor: const Color(0xFFF0F2F5),
       body: Column(
         children: [
-          const _TopBar(title: 'AI Health Monitor — Patients'),
+          _TopBar(
+            title: 'AI Health Monitor — Patients',
+            trailing: IconButton(
+              tooltip: 'Sign out',
+              icon: const Icon(Icons.logout, color: Colors.white, size: 20),
+              onPressed: () => FirebaseAuth.instance.signOut(),
+            ),
+          ),
           Container(
             width: double.infinity,
             padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
