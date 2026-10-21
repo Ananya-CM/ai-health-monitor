@@ -18,7 +18,22 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 
 cnn_model     = tf.keras.models.load_model(os.path.join(BASE, 'models', 'cardiac_cnn_ppg_final.h5'))
 autoencoder   = tf.keras.models.load_model(os.path.join(BASE, 'models', 'lstm_autoencoder.keras'))
-diabetes_lstm = tf.keras.models.load_model(os.path.join(BASE, 'models', 'diabetes_lstm.keras'))
+diabetes_lstm = tf.keras.models.load_model(os.path.join(BASE, 'models', 'diabetes_lstm_final.keras'))
+with open(os.path.join(BASE, 'models', 'diabetes_final_config.json')) as _f:
+    DIABETES_CFG = json.load(_f)
+DIABETES_WINDOW    = int(DIABETES_CFG['window_steps'])
+DIABETES_THRESHOLD = float(DIABETES_CFG['alert_threshold'])
+DIABETES_GLU_LO, DIABETES_GLU_HI = DIABETES_CFG['ranges']['glucose']
+# Length of one model step. 300 s (5 min) is what the model was trained on; a
+# smaller value (e.g. DIABETES_STEP_SECONDS=10) only speeds up a demo.
+DIABETES_STEP_SECONDS = float(os.environ.get('DIABETES_STEP_SECONDS', DIABETES_CFG['step_minutes'] * 60))
+# The ESP32 reports sweat glucose as a 0-1 value (potentiometer emulation). The
+# model was trained on CGM readings in mg/dL, so the 0-1 value is mapped onto
+# the model's glucose range. This is a demonstration convention, not a
+# calibration: replace it when a calibrated glucose sensor is used.
+def glucose_to_mg_dl(sensor_value):
+    value = min(max(float(sensor_value), 0.0), 1.0)
+    return DIABETES_GLU_LO + value * (DIABETES_GLU_HI - DIABETES_GLU_LO)
 AE_THRESHOLD  = float(np.load(os.path.join(BASE, 'models', 'ae_threshold.npy'))[0])
 
 print(f"All models loaded. AE threshold: {AE_THRESHOLD:.6f}")
@@ -30,7 +45,9 @@ firebase_admin.initialize_app(cred, {
 print("Firebase Admin connected")
 
 # ── In-memory buffers ──────────────────────────────────────────────────────────
-patient_buffers = {}  # patient_id -> list of feature vectors
+patient_buffers = {}  # patient_id -> list of 5-minute mean glucose values (mg/dL)
+glucose_accum   = {}  # patient_id -> {'start': time, 'values': [mg/dL readings in the current step]}
+diabetes_risk_state = {}  # patient_id -> last model output
 last_alert_tier = {}  # patient_id -> last sent alert tier
 hrv_history     = {}  # patient_id -> list of (timestamp, hrv) tuples
 glucose_history = {}  # patient_id -> list of last 2 glucose readings
@@ -124,10 +141,12 @@ def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_r
 
     # AMBER — diabetes warning
     if alert_tier == "NONE":
-        if diab_risk > 0.65 or glucose > 0.80:
+        if diab_risk >= DIABETES_THRESHOLD or glucose > 0.80:
             alert_tier = "AMBER"
-            if diab_risk > 0.65:
-                alert_message = (f"DIABETES WARNING: High diabetes risk detected. "
+            if diab_risk >= DIABETES_THRESHOLD:
+                alert_message = (f"DIABETES WARNING: Glucose is likely to rise above "
+                                f"{DIABETES_CFG['high_glucose_mg_dl']:.0f} mg/dL within "
+                                f"{DIABETES_CFG['horizon_minutes']} minutes. "
                                 f"Risk score={diab_risk:.2f}. "
                                 f"Patient should check blood sugar.")
             else:
@@ -143,15 +162,28 @@ def classify_alert(hr, spo2, temp, activity, glucose, cnn_prob, ae_error, diab_r
                              f"abnormal pattern. HR={hr:.0f}, "
                              f"CNN score={cnn_prob:.2f}.")
 
-    # BLUE — advisory
-    if alert_tier == "NONE":
-        if diab_risk > 0.40:
-            alert_tier    = "BLUE"
-            alert_message = (f"DIABETES ADVISORY: Mild risk trend detected. "
-                             f"Risk={diab_risk:.2f}. "
-                             f"Schedule consultation within 48 hours.")
-
     return alert_tier, alert_message
+
+# ── Diabetes forecaster ────────────────────────────────────────────────────────
+def update_diabetes_risk(patient_id, sensor_glucose):
+    """Average readings into model steps; run the LSTM once per completed step."""
+    now = time.time()
+    acc = glucose_accum.setdefault(patient_id, {'start': now, 'values': []})
+    acc['values'].append(glucose_to_mg_dl(sensor_glucose))
+
+    if now - acc['start'] >= DIABETES_STEP_SECONDS:
+        history = patient_buffers.setdefault(patient_id, [])
+        history.append(float(np.mean(acc['values'])))
+        if len(history) > DIABETES_WINDOW:
+            history.pop(0)
+        glucose_accum[patient_id] = {'start': now, 'values': []}
+
+        if len(history) == DIABETES_WINDOW:
+            scaled = (np.array(history, dtype=np.float32) - DIABETES_GLU_LO) / (DIABETES_GLU_HI - DIABETES_GLU_LO)
+            model_input = np.clip(scaled, 0.0, 1.0).reshape(1, DIABETES_WINDOW, 1)
+            diabetes_risk_state[patient_id] = float(diabetes_lstm.predict(model_input, verbose=0)[0][0])
+
+    return diabetes_risk_state.get(patient_id, 0.0)  # 0.0 until the first full window
 
 # ── Run AI models on sensor data ───────────────────────────────────────────────
 def run_ai(patient_id, hr, spo2, hrv, temp, activity, glucose):
@@ -165,18 +197,9 @@ def run_ai(patient_id, hr, spo2, hrv, temp, activity, glucose):
     ae_recon = autoencoder.predict(cardiac_window, verbose=0)
     ae_error = float(np.mean(np.power(cardiac_window - ae_recon, 2)))
 
-    # Diabetes LSTM
-    feature_vec = np.array([hr/200, temp/40, activity/3, hrv/100, glucose])
-    if patient_id not in patient_buffers:
-        patient_buffers[patient_id] = []
-    patient_buffers[patient_id].append(feature_vec)
-    if len(patient_buffers[patient_id]) > 24:
-        patient_buffers[patient_id].pop(0)
-
-    diab_risk = 0.0
-    if len(patient_buffers[patient_id]) == 24:
-        lstm_input = np.array(patient_buffers[patient_id]).reshape(1, 24, 5)
-        diab_risk  = float(diabetes_lstm.predict(lstm_input, verbose=0)[0][0])
+    # Diabetes forecaster: 2 h of glucose in 5-minute steps -> chance that
+    # glucose is above 140 mg/dL 30 minutes from now.
+    diab_risk = update_diabetes_risk(patient_id, glucose)
 
     # HRV trend + alert classification
     hypo_confirmed = is_hypo_confirmed(patient_id, glucose)
@@ -360,7 +383,7 @@ def analyse():
 def health():
     return jsonify({
         "status":       "running",
-        "models":       ["cardiac_cnn", "lstm_autoencoder", "diabetes_lstm"],
+        "models":       ["cardiac_cnn", "lstm_autoencoder", "diabetes_lstm_final"],
         "ae_threshold": AE_THRESHOLD,
         "timestamp":    datetime.now().isoformat()
     }), 200
