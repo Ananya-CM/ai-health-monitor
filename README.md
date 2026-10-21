@@ -72,9 +72,11 @@ A real-time IoT + AI health monitoring system that uses wearable sensors to trac
 - Reconstruction threshold: **0.020282**
 - Detects unusual vital sign patterns (anomaly detection)
 
-### 3. Diabetes LSTM (`diabetes_lstm.keras`)
-- AUC: **98.97%** | Accuracy: **94.68%**
-- Predicts diabetes risk from glucose, HR, HRV, activity
+### 3. Diabetes LSTM (`diabetes_lstm_final.keras`)
+- Glucose-trend forecaster: input is the last 2 hours of glucose in 5-minute steps; output is the probability that glucose will be above 140 mg/dL 30 minutes later
+- Evaluated on unseen patients (4-fold cross-validation, split by patient) on the Big Ideas Lab glycemic dataset (16 patients, Dexcom CGM): **ROC-AUC 0.882, PR-AUC 0.608**, ahead of the "glucose stays what it is now" baseline (0.848 / 0.535)
+- Runs on the glucose stream alone, so it works with any glucose sensor that reports readings
+- In the demonstration setup the glucose value comes from the potentiometer (0 to 1) and is mapped onto 40-400 mg/dL
 
 ---
 
@@ -86,9 +88,8 @@ A real-time IoT + AI health monitoring system that uses wearable sensors to trac
 | 🔴 RED | CNN > 0.75 AND AE > 0.020282 AND (HR > 150 or HR < 40 or SpO₂ < 94) | Cardiac event |
 | 🔴 RED | Glucose < 0.05 mmol/L | Hypoglycemia |
 | 🔴 RED | Activity > 0.8 AND HR > 100 AND Glucose < 0.1 | Tremor episode |
-| 🟡 AMBER | Diabetes risk > 0.65 OR Glucose > 0.80 mmol/L | High diabetes risk |
+| 🟡 AMBER | Diabetes forecast risk ≥ 0.579 (glucose likely above 140 mg/dL within 30 min) OR Glucose > 0.80 | High glucose forecast |
 | 🟡 AMBER | CNN > 0.50 AND HR > 100 | Cardiac pre-event |
-| 🔵 BLUE | Diabetes risk > 0.40 | Advisory |
 | 🔵 BLUE | HRV declining > 30% over monitoring period | HRV warning |
 
 ---
@@ -151,7 +152,7 @@ pip install -r requirements.txt
 # backend/serviceAccountKey.json (not committed). Set your database URL in app.py.
 
 # Place the three trained models in backend/models/ (not committed):
-#   cardiac_cnn_ppg_final.h5, lstm_autoencoder.keras, diabetes_lstm.keras, ae_threshold.npy
+#   cardiac_cnn_ppg_final.h5, lstm_autoencoder.keras, diabetes_lstm_final.keras, diabetes_final_config.json, ae_threshold.npy
 
 # Run the backend
 python app.py
@@ -201,7 +202,8 @@ ai-health-monitor/
 │   └── models/
 │       ├── cardiac_cnn_ppg_final.h5
 │       ├── lstm_autoencoder.keras
-│       └── diabetes_lstm.keras
+│       ├── diabetes_lstm_final.keras
+│       └── diabetes_final_config.json
 ├── firmware/
 │   └── esp32_health_monitor/
 │       └── esp32_health_monitor.ino  # Arduino sketch for ESP32 (+ secrets.h, not committed)
@@ -227,7 +229,7 @@ All models were trained in Google Colab. Notebooks are in the `notebooks/` folde
 **Dataset sources:**
 - Cardiac CNN: PhysioNet ECG database + custom PPG recordings
 - LSTM Autoencoder: Synthetic vital sign sequences
-- Diabetes LSTM: PIMA Indians Diabetes Dataset + glucose augmentation
+- Diabetes LSTM: Big Ideas Lab glycemic variability and wearable device dataset (Dexcom CGM, 16 patients)
 
 **Trained models are saved to Google Drive:**
 ```
